@@ -351,39 +351,68 @@ function cssDeclarations(style) {
   const declarations = [];
   const closers = [];
   const isCssSpace = ch => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
-  let current = '';
+  // Pieces of the declaration being read, or null when nothing has been
+  // substituted yet. Pushing slices beats `current += c` per character: the run
+  // of `(` in the self-test's 400k-char input made the concatenation 38 ms of
+  // the 128 ms it took, and GC most of the rest. Most declarations never hit a
+  // substitution, so they take the `null` path and one slice, no array.
+  let parts = null;
+  // Start of the run of characters copied verbatim since the last push. Every
+  // branch below either leaves the run alone (escapes, quotes, closers all
+  // copy through unchanged) or closes it, pushes a replacement, and moves it.
+  let start = 0;
   let quote = null;
   for (let i = 0; i < style.length; i++) {
     const c = style[i];
     if (c === '\\' && i + 1 < style.length) {
-      const escaped = style[i + 1] === '\r' && style[i + 2] === '\n' ? '\r\n' : style[i + 1];
-      current += c + escaped;
-      i += escaped.length;
+      i += style[i + 1] === '\r' && style[i + 2] === '\n' ? 2 : 1;
       continue;
     }
     if (quote) {
-      current += c;
       if (c === quote || c === '\n' || c === '\r' || c === '\f') quote = null;
       continue;
     }
     if (c === '/' && style[i + 1] === '*') {
       const end = style.indexOf('*/', i + 2);
+      // A comment counts as whitespace, so the run ends and one space is
+      // emitted in its place.
+      parts ??= [];
+      if (i > start) parts.push(style.slice(start, i));
+      parts.push(' ');
       i = end === -1 ? style.length : end + 1;
-      current += ' ';
+      start = i + 1;
       continue;
     }
     if (c === ';' && closers.length === 0) {
-      declarations.push(current);
-      current = '';
+      if (parts === null) {
+        declarations.push(style.slice(start, i));
+      } else {
+        if (i > start) parts.push(style.slice(start, i));
+        declarations.push(parts.join(''));
+        parts = null;
+      }
+      start = i + 1;
       continue;
     }
-    if (c === '(' && /(?:^|[^\w\u0080-\uffff-])url$/i.test(style.slice(Math.max(0, i - 4), i))) {
+    // Is this `(` the one opening an unquoted `url(`? Checked by comparing the
+    // three characters before it directly. The old `slice(...)` + regex did the
+    // same job but allocated a 4-char string and ran the engine's regex on it
+    // once per `(`, which was 48 ms of that same 128 ms.
+    if (
+      c === '('
+      && i >= 3
+      && (style[i - 1] === 'l' || style[i - 1] === 'L')
+      && (style[i - 2] === 'r' || style[i - 2] === 'R')
+      && (style[i - 3] === 'u' || style[i - 3] === 'U')
+      && (i - 4 < 0 || !/[\w\u0080-\uffff-]/.test(style[i - 4]))
+    ) {
       let bodyStart = i + 1;
       while (bodyStart < style.length && isCssSpace(style[bodyStart])) bodyStart++;
       if (style[bodyStart] !== '"' && style[bodyStart] !== "'") {
         let end = i + 1;
         while (end < style.length && style[end] !== ')') end += style[end] === '\\' ? 2 : 1;
-        current += style.slice(i, end + 1);
+        // The body is copied through verbatim, so the only substitution here is
+        // none at all: leave `start` alone and the run keeps growing.
         i = Math.min(end, style.length - 1);
         continue;
       }
@@ -393,9 +422,13 @@ function cssDeclarations(style) {
     else if (c === '[') closers.push(']');
     else if (c === '{') closers.push('}');
     else if (c === closers[closers.length - 1]) closers.pop();
-    current += c;
   }
-  declarations.push(current);
+  if (parts === null) {
+    declarations.push(style.slice(start));
+  } else {
+    if (style.length > start) parts.push(style.slice(start));
+    declarations.push(parts.join(''));
+  }
   return declarations;
 }
 
@@ -1084,6 +1117,9 @@ function runSelfTest() {
   check('a long run of comments does not backtrack catastrophically', performance.now() - auditStarted < 1000);
   // Looking back for `url` on every open paren must not flatten the text built
   // so far each time: that made a long run of `(` quadratic, seconds at 400k.
+  // The per-character copy and the per-paren `slice` + regex are gone, which
+  // took this input from 454 ms to ~30 ms here. macOS runners are roughly 3x
+  // slower than the development box and were failing the old 1 s budget.
   const manyParens = `<span style="${'('.repeat(400000)}">Senior engineer</span>`;
   const parensStarted = performance.now();
   auditAts(buildCleanHtml({ extraBody: manyParens }));
